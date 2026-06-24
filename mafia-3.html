@@ -672,14 +672,10 @@ async function connectRoom(code, asHost, myName){
       const m = await import(url);
       if(!m || !m.joinRoom) continue;
       const r = m.joinRoom({appId:'hanbam-mafia-jsy-v1-test'}, 'HM-probe-'+code);
-      // room이 필요한 메서드를 모두 가지고 있는지 검증
-      if(typeof r.makeAction==='function' &&
-         typeof r.onPeerJoin==='function' &&
-         typeof r.onPeerLeave==='function'){
-        try{ r.leave(); }catch(e){}   // probe room 즉시 정리
-        mod=m; break;
-      }
+      // 핵심은 makeAction(씬/입력/채팅 송수신). peer 입장·퇴장 감지는 없어도 동작.
+      const ok = r && typeof r.makeAction==='function';
       try{ r.leave(); }catch(e){}
+      if(ok){ mod=m; break; }
     }catch(e){ lastErr=e; }
   }
   if(!mod){
@@ -703,31 +699,40 @@ async function connectRoom(code, asHost, myName){
   const [sendScene,getScene]=mkAction('scene');
   const [sendInput,getInput]=mkAction('input');
   const [sendJoin ,getJoin ]=mkAction('join');
+  const [sendChat ,getChat ]=mkAction('chat');
 
   NET={ room, code, isHost:asHost, selfId:mod.selfId||room.selfId, myName,
-        send:{scene:sendScene, input:sendInput, join:sendJoin} };
+        send:{scene:sendScene, input:sendInput, join:sendJoin, chat:sendChat} };
 
   getScene((data)=>{ if(!NET.isHost) try{ renderScene(data); }catch(e){ showErr(e.message); } });
   getInput((data,peerId)=>{ if(NET.isHost) try{ hostInput(peerId,data); }catch(e){ showErr(e.message); } });
   getJoin ((data,peerId)=>{ if(NET.isHost) hostJoin(peerId, data&&data.name); });
+  getChat ((data)=>{ try{ chatReceive(data); }catch(e){} });
+  try{ chatInit(); }catch(e){}
 
+  const hasFn=(o,k)=>o&&typeof o[k]==='function';
   if(asHost){
     ROSTER=[{peerId:NET.selfId, name:myName}];
     lobbyJester=false;
-    room.onPeerLeave(peerId=>hostPeerLeft(peerId));
+    if(hasFn(room,'onPeerLeave')) room.onPeerLeave(peerId=>hostPeerLeft(peerId));
     rebroadcastLobby();
   }else{
     const announce=()=>{ try{ NET.send.join({name:myName}); }catch(e){} };
-    room.onPeerJoin(()=>announce());
-    room.onPeerLeave(()=>{ if(Object.keys(room.getPeers()).length===0) clientHostLost(); });
+    if(hasFn(room,'onPeerJoin')) room.onPeerJoin(()=>announce());
+    if(hasFn(room,'onPeerLeave')) room.onPeerLeave(()=>{
+      try{ if(hasFn(room,'getPeers') && Object.keys(room.getPeers()).length===0) clientHostLost(); }catch(e){}
+    });
     setTimeout(announce, 400);
     setTimeout(announce, 1500);
+    // onPeerJoin이 없는 빌드 대비: 잠시 동안 주기적으로 이름 재전송(호스트가 받을 때까지)
+    let tries=0; const iv=setInterval(()=>{ announce(); if(++tries>=8||!NET) clearInterval(iv); }, 1200);
   }
 }
 
 function leaveRoom(){
   if(discTick){ clearInterval(discTick); discTick=null; }
   if(O&&O._discTimer){ clearTimeout(O._discTimer); }
+  try{ chatDestroy(); }catch(e){}
   try{ NET&&NET.room&&NET.room.leave(); }catch(e){}
   NET=null; O=null; ROSTER=[];
 }
@@ -780,7 +785,7 @@ function oCheckWin(){
   return null;
 }
 function idxByPeer(peerId){ return O.players.findIndex(p=>p.peerId===peerId); }
-function oEmit(i, scene){ const p=O.players[i]; if(!p) return; if(p.peerId===NET.selfId) renderScene(scene); else NET.send.scene(scene, p.peerId); }
+function oEmit(i, scene){ const p=O.players[i]; if(!p) return; if(scene && typeof scene==='object') scene.you=i; if(p.peerId===NET.selfId) renderScene(scene); else NET.send.scene(scene, p.peerId); }
 function oBroadcast(scene){ NET.send.scene(scene); renderScene(scene); }
 function seatPayload(revealAll){
   return O.players.map(p=>({name:p.name, alive:p.alive, color:p.role.color, roleName:p.role.name,
@@ -1214,6 +1219,347 @@ function renderLobby(s){
   w.appendChild(leave);
   add(w);
 }
+
+/* ════════ 온라인 채팅 (친구끼리 플레이 시) ════════
+   풀메시 P2P 브로드캐스트 + 본인 화면 즉시 표시. 게임 진행과 독립적으로 동작. */
+function chatInjectCSS(){
+  if(document.getElementById('chat-css')) return;
+  const st=document.createElement('style'); st.id='chat-css';
+  st.textContent =
+    '#chatbox{position:fixed;right:12px;bottom:12px;z-index:45;display:flex;flex-direction:column;align-items:flex-end;font-family:var(--sans)}'+
+    '#chat-toggle{width:52px;height:52px;border-radius:50%;border:1px solid var(--line);background:var(--amber);color:#241a06;font-size:22px;box-shadow:0 4px 16px rgba(0,0,0,.4);cursor:pointer}'+
+    '#chat-panel{display:none;width:min(78vw,320px);height:min(46vh,380px);margin-bottom:10px;flex-direction:column;'+
+    'background:rgba(20,24,33,.92);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:14px;overflow:hidden}'+
+    '#chatbox.open #chat-panel{display:flex}'+
+    '#chat-head{padding:9px 13px;font:600 12px/1 var(--mono);letter-spacing:.18em;color:var(--amber);border-bottom:1px solid var(--line)}'+
+    '#chat-msgs{flex:1;overflow-y:auto;padding:10px 12px;display:flex;flex-direction:column;gap:7px}'+
+    '#chat-msgs .m{font-size:14px;line-height:1.4;color:var(--bone);word-break:break-word}'+
+    '#chat-msgs .m b{color:var(--amber);font-weight:600;margin-right:5px}'+
+    '#chat-msgs .m.sys{color:var(--muted);font-style:italic;font-size:13px}'+
+    '#chat-in{display:flex;gap:7px;padding:9px;border-top:1px solid var(--line)}'+
+    '#chat-in input{flex:1;font:500 15px var(--sans);color:var(--bone);background:#0f1118;border:1px solid var(--line);border-radius:9px;padding:9px 11px}'+
+    '#chat-in button{padding:0 14px;border-radius:9px;background:var(--amber);color:#241a06;border:none;font-weight:700}'+
+    '#chat-toggle .badge{position:absolute;top:-3px;right:-3px;min-width:18px;height:18px;padding:0 4px;border-radius:9px;background:var(--crimson);color:#fff;font:700 11px/18px var(--sans);display:none}'+
+    '#chatbox.open #chat-toggle .badge{display:none}';
+  document.head.appendChild(st);
+}
+let chatUnread=0;
+function chatInit(){
+  if(document.getElementById('chatbox')) return;
+  chatInjectCSS();
+  const box=document.createElement('div'); box.id='chatbox';
+  box.innerHTML =
+    '<div id="chat-panel">'+
+      '<div id="chat-head">채팅</div>'+
+      '<div id="chat-msgs"></div>'+
+      '<div id="chat-in"><input id="chat-text" placeholder="메시지…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="send"><button id="chat-send">전송</button></div>'+
+    '</div>'+
+    '<button id="chat-toggle">💬<span class="badge">0</span></button>';
+  document.body.appendChild(box);
+  const toggle=box.querySelector('#chat-toggle');
+  const input=box.querySelector('#chat-text');
+  const send=box.querySelector('#chat-send');
+  toggle.onclick=()=>{ box.classList.toggle('open'); if(box.classList.contains('open')){ chatUnread=0; updateBadge(); setTimeout(()=>input.focus(),50); } };
+  send.onclick=chatSend;
+  // 한글 IME 조합 상태 추적 → 조합 중 Enter로 전송하지 않음(받침 잘림/자모 뒤섞임 방지)
+  let composing=false;
+  input.addEventListener('compositionstart',()=>{ composing=true; });
+  input.addEventListener('compositionend',()=>{ composing=false; });
+  input.addEventListener('keydown',e=>{
+    if(e.key==='Enter' && !composing && !e.isComposing && e.keyCode!==229){ e.preventDefault(); chatSend(); }
+  });
+  chatAppend(null,'친구들과 대화할 수 있어요.',true);
+}
+function updateBadge(){
+  const b=document.querySelector('#chat-toggle .badge'); if(!b) return;
+  b.textContent=chatUnread; b.style.display=chatUnread>0?'block':'none';
+}
+function chatAppend(name, text, sys){
+  const list=document.getElementById('chat-msgs'); if(!list) return;
+  const m=document.createElement('div'); m.className='m'+(sys?' sys':'');
+  if(sys) m.textContent=text;
+  else { m.innerHTML='<b></b><span></span>'; m.querySelector('b').textContent=name+':'; m.querySelector('span').textContent=text; }
+  list.appendChild(m);
+  while(list.children.length>80) list.removeChild(list.firstChild);
+  list.scrollTop=list.scrollHeight;
+}
+function chatReceive(data){
+  if(!data||!data.text) return;
+  chatAppend((data.name||'익명').slice(0,12), String(data.text).slice(0,300), false);
+  const box=document.getElementById('chatbox');
+  if(box && !box.classList.contains('open')){ chatUnread++; updateBadge(); }
+}
+function chatSend(){
+  const input=document.getElementById('chat-text'); if(!input||!NET) return;
+  const text=input.value.trim(); if(!text) return;
+  input.value='';
+  try{ NET.send.chat({name:NET.myName, text:text.slice(0,300)}); }catch(e){}
+  chatAppend(NET.myName, text, false);   // 본인 화면에 즉시 표시
+}
+function chatDestroy(){
+  const box=document.getElementById('chatbox'); if(box) box.remove();
+  chatUnread=0;
+}
+
+/* ════════ 3D 배경 씬 (Three.js) ════════
+   원형 탁자 + 둘러앉은 플레이어 + 중앙 랜턴. 어두운 분위기, 밤이면 랜턴이 꺼진다.
+   로드 실패해도 게임 진행에는 영향 없음(전부 try/catch). cue()를 훅으로 사용. */
+
+let TH3=null, G3=null, scene3dRAF=0, scene3dWantNight=false, scene3dLastCount=4, scene3dOn=false;
+let scene3dMyIndex=-1;                 // 온라인: 내 자리 번호(-1이면 미지정/오프라인)
+// 1인칭: 머리 돌리기(드래그) 목표값과 부드럽게 따라가는 현재값
+let scene3dYawT=0, scene3dPitchT=0, scene3dYaw=0, scene3dPitch=0;
+const SCENE3D_COLORS=[0xe05a4d,0x4d8be0,0x57b87a,0xe0a83c,0xa878c0,0xe07ab0,0x49b6c0,0xcad24a];
+
+async function load3D(){
+  if(TH3) return TH3;
+  const cdns=[
+    'https://esm.sh/three@0.161.0',
+    'https://cdn.jsdelivr.net/npm/three@0.161.0/+esm',
+    'https://esm.run/three@0.161.0'
+  ];
+  for(const url of cdns){
+    try{ const m=await import(url); if(m && m.WebGLRenderer && m.Scene){ TH3=m; return m; } }
+    catch(e){}
+  }
+  return null;
+}
+
+function inject3DCSS(){
+  if(document.getElementById('scene3d-css')) return;
+  const st=document.createElement('style'); st.id='scene3d-css';
+  st.textContent =
+    '#scene3d{position:fixed;inset:0;width:100%;height:100%;z-index:0;display:none;pointer-events:none}'+
+    'body.scene-on{background:#06070c}'+
+    'body.scene-on #app{position:relative;z-index:1}'+
+    'body.scene-on .card{background:linear-gradient(180deg,rgba(27,31,42,.74),rgba(20,24,33,.8));'+
+    'backdrop-filter:blur(7px);-webkit-backdrop-filter:blur(7px);border-color:rgba(86,96,122,.55)}';
+  document.head.appendChild(st);
+}
+
+function getSeatCount(){
+  try{ if(typeof O!=='undefined' && O && O.players && O.players.length) return O.players.length; }catch(e){}
+  try{ if(typeof S!=='undefined' && S && S.players && S.players.length) return S.players.length; }catch(e){}
+  return scene3dLastCount||4;
+}
+
+async function scene3dEnsure(){
+  if(G3) return G3;
+  inject3DCSS();
+  const T=await load3D();
+  if(!T || G3) return G3;
+
+  const canvas=document.createElement('canvas'); canvas.id='scene3d';
+  document.body.insertBefore(canvas, document.body.firstChild);
+  const renderer=new T.WebGLRenderer({canvas, antialias:true});
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio||1, 2));
+
+  const scene=new T.Scene();
+  scene.background=new T.Color(0x06070c);
+  scene.fog=new T.Fog(0x06070c, 7, 16);
+
+  const camera=new T.PerspectiveCamera(48, 1, 0.1, 100);
+  camera.position.set(0, 2.5, 5.4);
+
+  const amb=new T.AmbientLight(0x2b3656, 0.55); scene.add(amb);
+  const moon=new T.DirectionalLight(0x6677aa, 0.22); moon.position.set(-5,9,3); scene.add(moon);
+
+  // 탁자 상판
+  const table=new T.Mesh(new T.CylinderGeometry(3,3,0.32,56),
+    new T.MeshStandardMaterial({color:0x8a431a, roughness:0.85, metalness:0.04}));
+  scene.add(table);
+  const rim=new T.Mesh(new T.TorusGeometry(3,0.13,12,56),
+    new T.MeshStandardMaterial({color:0x5d2c0f, roughness:0.9}));
+  rim.rotation.x=Math.PI/2; rim.position.y=0.16; scene.add(rim);
+  // 다리
+  const legMat=new T.MeshStandardMaterial({color:0x47230f, roughness:0.95});
+  for(let i=0;i<4;i++){ const a=Math.PI/4 + i*Math.PI/2;
+    const leg=new T.Mesh(new T.CylinderGeometry(0.14,0.1,3,10), legMat);
+    leg.position.set(Math.cos(a)*2.4,-1.66,Math.sin(a)*2.4); scene.add(leg); }
+
+  // 랜턴
+  const lantern=new T.Group(); lantern.position.set(0,0.92,0); scene.add(lantern);
+  const cageMat=new T.MeshStandardMaterial({color:0x8b8e94, roughness:0.55, metalness:0.45});
+  lantern.add(new T.Mesh(new T.CylinderGeometry(0.34,0.34,0.7,16,1,true),
+    new T.MeshStandardMaterial({color:0xfff0c0, transparent:true, opacity:0.12, side:T.DoubleSide})));
+  const top=new T.Mesh(new T.ConeGeometry(0.42,0.3,10), cageMat); top.position.y=0.5; lantern.add(top);
+  const base=new T.Mesh(new T.CylinderGeometry(0.4,0.42,0.12,16), cageMat); base.position.y=-0.4; lantern.add(base);
+  [0.34,-0.34].forEach(y=>{ const r=new T.Mesh(new T.TorusGeometry(0.34,0.025,8,20), cageMat);
+    r.rotation.x=Math.PI/2; r.position.y=y; lantern.add(r); });
+  const handle=new T.Mesh(new T.TorusGeometry(0.18,0.022,8,18), cageMat); handle.position.y=0.62; lantern.add(handle);
+  // 불꽃
+  const flameMat=new T.MeshBasicMaterial({color:0xffc23c});
+  const flame=new T.Mesh(new T.SphereGeometry(0.15,16,16), flameMat);
+  flame.scale.set(1,1.6,1); lantern.add(flame);
+  const lLight=new T.PointLight(0xffb347, 2.4, 24, 1.7); lantern.add(lLight);
+
+  G3={renderer,scene,camera,lantern,flame,flameMat,lLight,amb,players:[],curKey:'',T,t0:performance.now()};
+  scene3dResize();
+  window.addEventListener('resize', scene3dResize);
+  scene3dSetPlayers(getSeatCount());
+  return G3;
+}
+
+function seatAngle(k, n){ return -Math.PI/2 + k*(Math.PI*2/n); } // 자리 k의 각도
+
+function scene3dSetPlayers(n){
+  if(!G3) return; const T=G3.T;
+  n=Math.max(2,Math.min(8,n|0));
+  const me=(scene3dMyIndex>=0 && scene3dMyIndex<n)?scene3dMyIndex:-1;
+  const key=n+'/'+me;
+  if(key===G3.curKey) return;
+  G3.curKey=key;
+  G3.players.forEach(p=>G3.scene.remove(p)); G3.players=[];
+  const r=3.05;
+  for(let k=0;k<n;k++){
+    if(k===me) continue;                       // 내 자리는 카메라(빈자리)
+    const a=seatAngle(k,n);
+    const col=SCENE3D_COLORS[k%SCENE3D_COLORS.length];
+    const mat=new T.MeshStandardMaterial({color:col, roughness:0.65});
+    const g=new T.Group();
+    const body=new T.Mesh(new T.SphereGeometry(0.5,18,18), mat); body.scale.set(1,1.25,1); body.position.y=0.5; g.add(body);
+    const head=new T.Mesh(new T.SphereGeometry(0.32,18,18), mat); head.position.y=1.22; g.add(head);
+    g.position.set(Math.cos(a)*r, -0.15, Math.sin(a)*r);
+    g.lookAt(0,0.7,0);
+    G3.scene.add(g); G3.players.push(g);
+  }
+}
+
+function scene3dResize(){
+  if(!G3) return;
+  const w=window.innerWidth, h=window.innerHeight;
+  G3.renderer.setSize(w,h,false);
+  G3.camera.aspect=w/h; G3.camera.updateProjectionMatrix();
+}
+
+function scene3dLoop(){
+  scene3dRAF=requestAnimationFrame(scene3dLoop);
+  if(!G3 || !scene3dOn) return;
+  const t=(performance.now()-G3.t0)/1000;
+  // 밤/낮 부드럽게 전환
+  const tgtL=scene3dWantNight?0:2.3, tgtA=scene3dWantNight?0.12:0.55;
+  G3.lLight.intensity += (tgtL-G3.lLight.intensity)*0.07;
+  G3.amb.intensity   += (tgtA-G3.amb.intensity)*0.07;
+  if(!scene3dWantNight){ // 촛불 깜빡임
+    G3.lLight.intensity += Math.sin(t*13)*0.18 + (Math.random()-0.5)*0.12;
+    G3.flame.scale.y = 1.5 + Math.sin(t*9)*0.18;
+    G3.flameMat.color.setHSL(0.11, 1, 0.55+Math.sin(t*15)*0.05);
+  }
+  G3.flame.visible = G3.lLight.intensity>0.15;
+
+  // ── 1인칭 카메라: 내 자리에 앉아 탁자 건너편을 본다 ──
+  const n=getSeatCount();
+  const me=(scene3dMyIndex>=0 && scene3dMyIndex<n)?scene3dMyIndex:-1;
+  const aMy=(me>=0)? seatAngle(me,n) : -Math.PI/2;       // 내 자리 각도(오프라인=정면)
+  const seatR=3.72, eyeY=1.4;
+  const tposX=Math.cos(aMy)*seatR, tposZ=Math.sin(aMy)*seatR;
+  // 카메라 위치를 자리로 부드럽게 이동
+  if(G3.px===undefined){ G3.px=tposX; G3.py=eyeY; G3.pz=tposZ; }
+  G3.px += (tposX-G3.px)*0.12; G3.py += (eyeY-G3.py)*0.12; G3.pz += (tposZ-G3.pz)*0.12;
+  G3.camera.position.set(G3.px, G3.py, G3.pz);
+  // 기본 시선: 탁자 중앙 쪽(자리 반대 방향). 드래그(머리 돌리기)는 부드럽게 따라감
+  scene3dYaw   += (scene3dYawT  -scene3dYaw  )*0.1;
+  scene3dPitch += (scene3dPitchT-scene3dPitch)*0.1;
+  const baseYaw=aMy+Math.PI, basePitch=-0.13;
+  const yaw=baseYaw+scene3dYaw + Math.sin(t*0.3)*0.008;   // 미세한 생동감
+  const pitch=Math.max(-0.55, Math.min(0.5, basePitch+scene3dPitch));
+  G3.camera.lookAt(
+    G3.px + Math.cos(pitch)*Math.cos(yaw),
+    G3.py + Math.sin(pitch),
+    G3.pz + Math.cos(pitch)*Math.sin(yaw)
+  );
+  G3.renderer.render(G3.scene, G3.camera);
+}
+
+async function scene3dShow(){
+  try{
+    await scene3dEnsure();
+    if(!G3) return;
+    scene3dOn=true;
+    document.body.classList.add('scene-on');
+    const c=document.getElementById('scene3d'); if(c) c.style.display='block';
+    scene3dSetPlayers(getSeatCount());
+    scene3dResize();
+    if(!scene3dRAF) scene3dLoop();
+  }catch(e){}
+}
+
+function scene3dHide(){
+  scene3dOn=false;
+  try{
+    document.body.classList.remove('scene-on');
+    const c=document.getElementById('scene3d'); if(c) c.style.display='none';
+    if(scene3dRAF){ cancelAnimationFrame(scene3dRAF); scene3dRAF=0; }
+  }catch(e){}
+}
+
+function scene3dNight(on){ scene3dWantNight=!!on; }
+
+/* ── 드래그/터치로 시선(머리) 돌리기 ── */
+(function initDrag(){
+  let dragging=false, lx=0, ly=0;
+  const noRotate=(el)=>{ // 버튼/입력/스크롤로그/채팅 위에서는 회전 안 함
+    while(el && el!==document.body){
+      if(el.tagName==='BUTTON'||el.tagName==='INPUT'||el.tagName==='TEXTAREA'||el.tagName==='A') return true;
+      if(el.id==='chatbox') return true;
+      if(el.classList && (el.classList.contains('log')||el.classList.contains('choice'))) return true;
+      el=el.parentElement;
+    }
+    return false;
+  };
+  const down=(x,y,t)=>{ if(!scene3dOn||noRotate(t)) return; dragging=true; lx=x; ly=y; };
+  const move=(x,y)=>{ if(!dragging) return;
+    const dx=x-lx, dy=y-ly; lx=x; ly=y;
+    scene3dYawT   += dx*0.005;                                  // 좌우로 고개 돌리기
+    scene3dPitchT -= dy*0.004;
+    scene3dYawT   = Math.max(-1.2, Math.min(1.2, scene3dYawT)); // 너무 뒤돌지 않게 제한
+    scene3dPitchT = Math.max(-0.42, Math.min(0.37, scene3dPitchT));
+  };
+  const up=()=>{ dragging=false; };
+  window.addEventListener('pointerdown', e=>down(e.clientX,e.clientY,e.target), {passive:true});
+  window.addEventListener('pointermove', e=>move(e.clientX,e.clientY), {passive:true});
+  window.addEventListener('pointerup', up, {passive:true});
+  window.addEventListener('pointercancel', up, {passive:true});
+})();
+
+/* ── 훅: cue()를 가로채 페이즈에 맞춰 밤/낮 + 표시 ── */
+if(typeof cue==='function'){
+  const _cue=cue;
+  cue=function(key){
+    try{ _cue(key); }catch(e){}
+    try{
+      if(key==='night'||key==='secret'){ scene3dNight(true); scene3dShow(); }
+      else if(key==='gameover'){ scene3dNight(false); }
+      else { scene3dNight(false); scene3dShow(); }
+    }catch(e){}
+  };
+}
+
+/* ── 클라이언트 인원 추적: 씬 데이터의 좌석 수를 기억 ── */
+if(typeof renderScene==='function'){
+  const _rs=renderScene;
+  renderScene=function(s){
+    try{
+      if(s){
+        if(typeof s.you==='number') scene3dMyIndex=s.you;
+        if(s.seats && s.seats.length) scene3dLastCount=s.seats.length;
+        else if(s.players && s.players.length) scene3dLastCount=s.players.length;
+        if(G3 && scene3dOn) scene3dSetPlayers(getSeatCount());
+      }
+    }catch(e){}
+    return _rs.apply(this, arguments);
+  };
+}
+
+/* ── 로비/홈/메뉴/오프라인설정으로 돌아가면 씬 숨김 ── */
+['screenHome','screenOnlineMenu','renderLobby','screenSetup'].forEach(fn=>{
+  try{
+    if(typeof window[fn]==='function'){
+      const orig=window[fn];
+      window[fn]=function(){ scene3dHide(); return orig.apply(this, arguments); };
+    }
+  }catch(e){}
+});
 
 /* ---------- 시작 ---------- */
 window.addEventListener('error',e=>{try{showErr((e.error&&e.error.message)||e.message||'오류');}catch(_){}});
