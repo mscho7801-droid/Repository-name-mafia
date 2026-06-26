@@ -1972,7 +1972,7 @@ window.fullscreen=function(){
   let curl=[1,1,1,1,1];          // 현재(렌더링) 굽힘값
   let tgt =[1,1,1,1,1];          // 목표 굽힘값
   let raise=0, raiseT=0;         // 손 들어올림 0~1
-  let gestureKind=null, gestureEnd=0, wagPhase=0;
+  let gestureKind=null, gestureEnd=0, wagPhase=0, handBaseZ=0;
 
   function playGesture(kind){
     if(!GEST[kind]) return;
@@ -2059,23 +2059,25 @@ window.fullscreen=function(){
       return m;
     };
     const H=new T.Group();
-    // 팔뚝
+    // 팔뚝(세로 고정)
     const fore=cap(0.085,0.5); fore.position.y=-0.28; H.add(fore);
+    // 손목 피벗: 손바닥·손가락·엄지를 여기에 담아 손목에서 꺾이게(따봉/흔들기)
+    const wrist=new T.Group(); wrist.position.y=-0.05; H.add(wrist);
     // 손바닥
-    const palm=new T.Mesh(new T.BoxGeometry(0.20,0.22,0.085), skin); palm.position.y=0.04; H.add(palm);
-    const palmTop=0.15;
+    const palm=new T.Mesh(new T.BoxGeometry(0.20,0.22,0.085), skin); palm.position.y=0.09; wrist.add(palm);
+    const palmTop=0.20;
     // 손가락(검지·중지·약지·새끼): 마디(group) 회전으로 굽힘 표현
     const fingers=[];
     [[-0.066,0.155],[-0.022,0.182],[0.022,0.16],[0.063,0.125]].forEach(sp=>{
       const fg=new T.Group(); fg.position.set(sp[0],palmTop,0);
       const seg=cap(0.028,sp[1]); seg.position.y=sp[1]/2; fg.add(seg);
-      H.add(fg); fingers.push(fg);
+      wrist.add(fg); fingers.push(fg);
     });
     // 엄지
-    const thumb=new T.Group(); thumb.position.set(-0.10,0.0,0.02);
+    const thumb=new T.Group(); thumb.position.set(-0.10,0.05,0.02);
     const tseg=cap(0.034,0.14); tseg.position.y=0.07; thumb.add(tseg);
-    H.add(thumb);
-    H.userData={fingers, thumb};
+    wrist.add(thumb);
+    H.userData={fingers, thumb, wrist};
     return H;
   }
 
@@ -2095,13 +2097,17 @@ window.fullscreen=function(){
     raise=lerp(raise,raiseT,0.16);
     H.visible = raise>0.02;
     H.position.y = -0.46 + raise*0.16;
+    // 손목 회전: 따봉이면 시계방향 90°로 꺾어 완성, 검지흔들기면 양옆으로 흔듦
+    const baseZ = (gestureKind==='thumbsup') ? -Math.PI/2 : 0;
+    handBaseZ = lerp(handBaseZ, baseZ, 0.16);
     let wagZ=0;
     if(gestureKind==='wag'){ wagPhase+=dt*9; wagZ=Math.sin(wagPhase)*0.5*raise; }   // 양옆으로 흔들기
-    H.rotation.z = wagZ;
+    ud.wrist.rotation.z = handBaseZ + wagZ;
     ud.fingers.forEach((fg,i)=>{ fg.rotation.x = -curl[i+1]*2.55; });               // 0=폄(위) · 1=접음(주먹)
-    const tc=curl[0];                                                               // 엄지
-    ud.thumb.rotation.z = tc*1.45;
-    ud.thumb.rotation.x = -tc*0.30;
+    // 엄지: 0=폄(따봉 — 손목 90° 회전 후 위를 향함) · 1=접음(다른 손가락처럼 주먹에 붙음)
+    const tc=curl[0];
+    ud.thumb.rotation.z = 1.5708 - tc*2.07;
+    ud.thumb.rotation.x = -tc*2.2;
   }
 
   /* ---- 매 프레임 (scene3dLoop에서 호출) → 누르고 있는 동안 계속 ---- */
