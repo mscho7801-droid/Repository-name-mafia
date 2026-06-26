@@ -679,9 +679,9 @@ async function connectRoom(code, asHost, myName){
   // 로컬 vendor 우선 → 실패 시 CDN 폴백
   const cdns=[
     './vendor/trystero-nostr.js',
-    'https://esm.sh/trystero/nostr',
-    'https://esm.sh/trystero/nostr?bundle',
-    'https://cdn.jsdelivr.net/npm/trystero/nostr/+esm'
+    'https://esm.sh/trystero@0.20.1/nostr',
+    'https://esm.sh/trystero@0.20.1/nostr?bundle',
+    'https://cdn.jsdelivr.net/npm/trystero@0.20.1/nostr/+esm'
   ];
   // P2P 신호용 릴레이: 두 기기가 반드시 같은 릴레이들에 모두 붙어야 서로를 찾음
   const TRY_RELAYS=[
