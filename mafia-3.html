@@ -683,11 +683,18 @@ async function connectRoom(code, asHost, myName){
     'https://esm.sh/trystero/nostr?bundle',
     'https://cdn.jsdelivr.net/npm/trystero/nostr/+esm'
   ];
+  // P2P 신호용 릴레이: 두 기기가 반드시 같은 릴레이들에 모두 붙어야 서로를 찾음
+  const TRY_RELAYS=[
+    'wss://relay.damus.io',
+    'wss://nos.lol',
+    'wss://relay.primal.net',
+    'wss://relay.nostr.band'
+  ];
   for(const url of cdns){
     try{
       const m = await import(url);
       if(!m || !m.joinRoom) continue;
-      const r = m.joinRoom({appId:'hanbam-mafia-jsy-v1-test'}, 'HM-probe-'+code);
+      const r = m.joinRoom({appId:'hanbam-mafia-jsy-v1-test', relayUrls:TRY_RELAYS, relayRedundancy:TRY_RELAYS.length}, 'HM-probe-'+code);
       const ok = r && typeof r.makeAction==='function';
       try{ r.leave(); }catch(e){}
       if(ok){ mod=m; break; }
@@ -701,7 +708,7 @@ async function connectRoom(code, asHost, myName){
   }
 
   let room;
-  try{ room = mod.joinRoom({appId:'hanbam-mafia-jsy-v1'}, 'HM-'+code); }
+  try{ room = mod.joinRoom({appId:'hanbam-mafia-jsy-v1', relayUrls:TRY_RELAYS, relayRedundancy:TRY_RELAYS.length}, 'HM-'+code); }
   catch(e){ return netError('방 연결에 실패했습니다. [상세: '+(e&&e.message||e)+']'); }
 
   const mkAction=(name)=>{
@@ -742,6 +749,11 @@ async function connectRoom(code, asHost, myName){
     setTimeout(announce, 400);
     setTimeout(announce, 1500);
     let tries=0; const iv=setInterval(()=>{ announce(); if(++tries>=8||!NET) clearInterval(iv); }, 1200);
+    setTimeout(()=>{
+      if(NET && !NET.isHost && !O && !NET.hostId){
+        showErr('호스트를 찾지 못했어요. 같은 코드인지, 호스트가 방을 연 채 기다리는지 확인하세요. 회사·학교 와이파이는 P2P 신호 서버를 막을 수 있어요(다른 망/데이터로 시도).');
+      }
+    }, 14000);
   }
 }
 
