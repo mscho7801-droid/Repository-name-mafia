@@ -1853,6 +1853,7 @@ function scene3dLoop(){
       } else { G3.myArm.visible=false; }
     }
   }catch(e){}
+  try{ if(typeof joyUpdate==='function') joyUpdate(); }catch(e){}
   G3.renderer.render(G3.scene, G3.camera);
 }
 
@@ -1941,6 +1942,182 @@ if(typeof renderScene==='function'){
     }
   }catch(e){}
 });
+
+/* ════════ 화면 컨트롤 (오른쪽 조이스틱=시점 · 왼쪽 버튼=손 제스처) + 전체화면 ════════ */
+window.fullscreen=function(){
+  try{
+    if(document.fullscreenElement||document.webkitFullscreenElement){
+      (document.exitFullscreen||document.webkitExitFullscreen||function(){}).call(document);
+    } else {
+      const el=document.documentElement;
+      (el.requestFullscreen||el.webkitRequestFullscreen||function(){}).call(el);
+    }
+  }catch(e){}
+};
+
+(function initControls(){
+  const VIEW_SPEED = 2.4;   // 시점 회전 속도 (누르고 있는 동안 계속 회전)
+  const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+  const lerp=(a,b,t)=>a+(b-a)*t;
+
+  let joyR={x:0,y:0};
+  let joyLast=0;
+
+  // 제스처별 손가락 굽힘값 (0=폄, 1=접음) : [엄지, 검지, 중지, 약지, 새끼]
+  const GEST={
+    middle:   [1, 1, 0, 1, 1],   // 중지 올리기
+    thumbsup: [0, 1, 1, 1, 1],   // 따봉
+    wag:      [1, 0, 1, 1, 1]    // 검지 펴고 양옆으로 흔들기
+  };
+  let curl=[1,1,1,1,1];          // 현재(렌더링) 굽힘값
+  let tgt =[1,1,1,1,1];          // 목표 굽힘값
+  let raise=0, raiseT=0;         // 손 들어올림 0~1
+  let gestureKind=null, gestureEnd=0, wagPhase=0;
+
+  function playGesture(kind){
+    if(!GEST[kind]) return;
+    tgt=GEST[kind].slice();
+    gestureKind=kind;
+    raiseT=1;
+    gestureEnd=performance.now()+2400;
+  }
+  window.handGesture=playGesture;
+
+  /* ---- CSS ---- */
+  if(!document.getElementById('ctl-css')){
+    const st=document.createElement('style'); st.id='ctl-css';
+    st.textContent =
+      '.joy{position:fixed;bottom:26px;right:18px;width:112px;height:112px;border-radius:50%;'+
+      'background:rgba(20,24,33,.32);border:1px solid rgba(140,156,188,.45);z-index:60;'+
+      'display:none;touch-action:none;user-select:none;-webkit-user-select:none}'+
+      'body.scene-on .joy{display:block}'+
+      '.joy .knob{position:absolute;left:50%;top:50%;width:50px;height:50px;margin:-25px 0 0 -25px;'+
+      'border-radius:50%;background:rgba(233,227,213,.85);box-shadow:0 2px 10px rgba(0,0,0,.45);pointer-events:none}'+
+      '.joy .lbl{position:absolute;left:0;right:0;top:-20px;text-align:center;'+
+      'font:600 10px var(--mono);letter-spacing:.22em;color:var(--amber);opacity:.85;pointer-events:none}'+
+      '.gest{position:fixed;left:14px;bottom:20px;z-index:60;display:none;flex-direction:column;gap:8px}'+
+      'body.scene-on .gest{display:flex}'+
+      '.gest button{width:54px;height:54px;border-radius:14px;font-size:24px;padding:0;cursor:pointer;'+
+      'background:rgba(20,24,33,.55);border:1px solid rgba(140,156,188,.5);color:var(--bone);'+
+      'box-shadow:0 2px 10px rgba(0,0,0,.4)}'+
+      '.gest button:active{transform:translateY(1px)}'+
+      '#fsbtn{position:fixed;top:10px;right:12px;z-index:75;width:auto;padding:8px 12px;cursor:pointer;'+
+      'font:600 12px var(--sans);border-radius:10px;background:rgba(20,24,33,.7);'+
+      'border:1px solid var(--line);color:var(--bone)}';
+    document.head.appendChild(st);
+  }
+
+  /* ---- 전체화면 버튼 ---- */
+  if(!document.getElementById('fsbtn')){
+    const b=document.createElement('button'); b.id='fsbtn'; b.type='button'; b.textContent='⛶ 전체화면';
+    b.addEventListener('click', ()=>window.fullscreen());
+    document.body.appendChild(b);
+  }
+
+  /* ---- 시점 조이스틱 (오른쪽) ---- */
+  const elR=document.createElement('div'); elR.className='joy';
+  elR.innerHTML='<div class="lbl">시점</div><div class="knob"></div>';
+  document.body.appendChild(elR);
+  (function bindJoy(el, onVec){
+    const knob=el.querySelector('.knob');
+    let id=null, cx=0, cy=0, R=46;
+    const stop=e=>{ e.preventDefault(); e.stopPropagation(); };
+    function place(x,y){
+      let dx=x-cx, dy=y-cy; const d=Math.hypot(dx,dy);
+      if(d>R){ dx=dx/d*R; dy=dy/d*R; }
+      knob.style.transform='translate('+dx+'px,'+dy+'px)';
+      onVec(dx/R, dy/R);
+    }
+    el.addEventListener('pointerdown', e=>{ if(id!==null) return; id=e.pointerId;
+      try{ el.setPointerCapture(id); }catch(_){}
+      const r=el.getBoundingClientRect(); cx=r.left+r.width/2; cy=r.top+r.height/2; R=r.width/2-10;
+      stop(e); place(e.clientX,e.clientY); });
+    el.addEventListener('pointermove', e=>{ if(e.pointerId!==id) return; stop(e); place(e.clientX,e.clientY); });
+    const end=e=>{ if(e.pointerId!==id) return; stop(e); id=null; knob.style.transform='translate(0,0)'; onVec(0,0); };
+    el.addEventListener('pointerup', end); el.addEventListener('pointercancel', end);
+  })(elR, (x,y)=>{ joyR.x=x; joyR.y=y; });
+
+  /* ---- 제스처 버튼 (왼쪽) ---- */
+  const gestWrap=document.createElement('div'); gestWrap.className='gest';
+  [['🖕','중지 올리기','middle'],['👍','따봉','thumbsup'],['☝️','검지 흔들기','wag']].forEach(g=>{
+    const b=document.createElement('button'); b.type='button'; b.title=g[1]; b.textContent=g[0];
+    b.addEventListener('pointerdown', e=>{ e.stopPropagation(); });
+    b.addEventListener('click', e=>{ e.stopPropagation(); playGesture(g[2]); });
+    gestWrap.appendChild(b);
+  });
+  document.body.appendChild(gestWrap);
+
+  /* ---- 왼손 모델 (손바닥 + 손가락 5개) : 카메라에 부착 ---- */
+  function buildHand(T){
+    const skin=new T.MeshStandardMaterial({color:0xe7decb, roughness:0.6, metalness:0.0});
+    const cap=(rad,len)=>{
+      if(T.CapsuleGeometry) return new T.Mesh(new T.CapsuleGeometry(rad,len,5,12), skin);
+      const m=new T.Group();
+      m.add(new T.Mesh(new T.CylinderGeometry(rad,rad,len,12), skin));
+      const a=new T.Mesh(new T.SphereGeometry(rad,12,8),skin); a.position.y= len/2; m.add(a);
+      const c=new T.Mesh(new T.SphereGeometry(rad,12,8),skin); c.position.y=-len/2; m.add(c);
+      return m;
+    };
+    const H=new T.Group();
+    // 팔뚝
+    const fore=cap(0.085,0.5); fore.position.y=-0.28; H.add(fore);
+    // 손바닥
+    const palm=new T.Mesh(new T.BoxGeometry(0.20,0.22,0.085), skin); palm.position.y=0.04; H.add(palm);
+    const palmTop=0.15;
+    // 손가락(검지·중지·약지·새끼): 마디(group) 회전으로 굽힘 표현
+    const fingers=[];
+    [[-0.066,0.155],[-0.022,0.182],[0.022,0.16],[0.063,0.125]].forEach(sp=>{
+      const fg=new T.Group(); fg.position.set(sp[0],palmTop,0);
+      const seg=cap(0.028,sp[1]); seg.position.y=sp[1]/2; fg.add(seg);
+      H.add(fg); fingers.push(fg);
+    });
+    // 엄지
+    const thumb=new T.Group(); thumb.position.set(-0.10,0.0,0.02);
+    const tseg=cap(0.034,0.14); tseg.position.y=0.07; thumb.add(tseg);
+    H.add(thumb);
+    H.userData={fingers, thumb};
+    return H;
+  }
+
+  function updateHand(dt){
+    if(typeof G3==='undefined' || !G3 || !G3.T) return;
+    const T=G3.T;
+    if(!G3.handObj){
+      G3.handObj=buildHand(T);
+      G3.handObj.position.set(-0.17,-0.46,-0.62);
+      G3.handObj.rotation.x=-0.18;
+      G3.handObj.visible=false;
+      try{ G3.camera.add(G3.handObj); }catch(_){}
+    }
+    const H=G3.handObj, ud=H.userData;
+    if(gestureKind && performance.now()>gestureEnd){ gestureKind=null; raiseT=0; tgt=[1,1,1,1,1]; }
+    for(let i=0;i<5;i++) curl[i]=lerp(curl[i],tgt[i],0.22);
+    raise=lerp(raise,raiseT,0.16);
+    H.visible = raise>0.02;
+    H.position.y = -0.46 + raise*0.16;
+    let wagZ=0;
+    if(gestureKind==='wag'){ wagPhase+=dt*9; wagZ=Math.sin(wagPhase)*0.5*raise; }   // 양옆으로 흔들기
+    H.rotation.z = wagZ;
+    ud.fingers.forEach((fg,i)=>{ fg.rotation.x = -curl[i+1]*2.55; });               // 0=폄(위) · 1=접음(주먹)
+    const tc=curl[0];                                                               // 엄지
+    ud.thumb.rotation.z = tc*1.45;
+    ud.thumb.rotation.x = -tc*0.30;
+  }
+
+  /* ---- 매 프레임 (scene3dLoop에서 호출) → 누르고 있는 동안 계속 ---- */
+  window.joyUpdate=function(){
+    const now=performance.now();
+    let dt=joyLast?(now-joyLast)/1000:0.016; joyLast=now;
+    if(dt>0.05) dt=0.05;
+    if(joyR.x||joyR.y){            // 오른쪽 → 시점 (계속 회전)
+      scene3dYawT   += joyR.x * VIEW_SPEED * dt;
+      scene3dPitchT -= joyR.y * VIEW_SPEED * dt;
+      scene3dYawT   = Math.max(-Math.PI, Math.min(Math.PI, scene3dYawT));
+      scene3dPitchT = Math.max(-0.7, Math.min(0.6, scene3dPitchT));
+    }
+    try{ updateHand(dt); }catch(_){}
+  };
+})();
 
 /* ---------- 시작 ---------- */
 window.addEventListener('error',e=>{try{showErr((e.error&&e.error.message)||e.message||'오류');}catch(_){}});
