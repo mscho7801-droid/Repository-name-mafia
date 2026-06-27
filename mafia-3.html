@@ -723,15 +723,17 @@ async function connectRoom(code, asHost, myName){
   const [sendJoin ,getJoin ]=mkAction('join');
   const [sendChat ,getChat ]=mkAction('chat');
   const [sendStatus,getStatus]=mkAction('stat');
+  const [sendGest ,getGest ]=mkAction('gest');
 
   NET={ room, code, isHost:asHost, selfId:mod.selfId||room.selfId, myName, hostId:null,
-        send:{scene:sendScene, input:sendInput, join:sendJoin, chat:sendChat, status:sendStatus} };
+        send:{scene:sendScene, input:sendInput, join:sendJoin, chat:sendChat, status:sendStatus, gesture:sendGest} };
 
   getScene((data,peerId)=>{ if(!NET.isHost){ if(peerId) NET.hostId=peerId; try{ renderScene(data); }catch(e){ showErr(e.message); } } });
   getInput((data,peerId)=>{ if(NET.isHost) try{ hostInput(peerId,data); }catch(e){ showErr(e.message); } });
   getJoin ((data,peerId)=>{ if(NET.isHost) hostJoin(peerId, data&&data.name); });
   getChat ((data,peerId)=>{ try{ if(NET.isHost) hostChat(peerId, data&&data.text, data&&data.to); else chatShow(data); }catch(e){} });
   getStatus((data)=>{ if(!NET.isHost) try{ applyStatus(data); }catch(e){} });
+  getGest ((data,peerId)=>{ try{ if(NET.isHost) hostGesture(peerId, data); else showSeatGesture(data&&data.seat, data&&data.kind); }catch(e){} });
   try{ chatInit(); }catch(e){}
 
   const hasFn=(o,k)=>o&&typeof o[k]==='function';
@@ -778,7 +780,10 @@ function clientHostLost(){
 
 /* ════════════════ 호스트: 로비 ════════════════ */
 function hostJoin(peerId, nm){
-  if(O){ NET.send.scene({kind:'wait', title:'게임 진행 중', sub:'이미 시작된 게임입니다. 다음 판을 기다려 주세요.'}, peerId); return; }
+  if(O){
+    if(idxByPeer(peerId)>=0) return;   // 이미 이번 판 참가자 → 중복 announce 무시(게임 화면 유지)
+    NET.send.scene({kind:'wait', title:'게임 진행 중', sub:'이미 시작된 게임입니다. 다음 판을 기다려 주세요.'}, peerId); return;
+  }
   if(ROSTER.length>=8 && !ROSTER.find(r=>r.peerId===peerId)){ NET.send.scene({kind:'wait', title:'정원 초과', sub:'방이 가득 찼습니다 (최대 8명).'}, peerId); return; }
   const ex=ROSTER.find(r=>r.peerId===peerId);
   if(ex) ex.name=(nm||ex.name).slice(0,10);
@@ -903,7 +908,7 @@ function oStartGame(){
   const ids=onlineSpread(n, lobbyJester);
   O={ players:ROSTER.map((r,i)=>({id:i, peerId:r.peerId, name:r.name, role:ROLES[ids[i]], alive:true, lives:2, revealed:false, deathCause:null, bot:!!r.bot, _mem:null})),
       round:1, log:[{t:'sys', s:`${n}명에게 2개의 목숨과 역할이 분배되었습니다.`}],
-      phase:'', nightActions:[], votes:{}, notes:[], pending:new Set(), _win:null, _discTimer:null, _secTimer:null };
+      phase:'', nightActions:[], votes:{}, notes:[], pending:new Set(), _win:null, _discTimer:null, _secTimer:null, _ackTimer:null };
   oRoleReveal();
 }
 function oRoleReveal(){
@@ -912,6 +917,13 @@ function oRoleReveal(){
   oStatusAll();
   O.players.forEach(p=>oEmit(p.id, {kind:'role', roleName:p.role.name, color:p.role.color, faction:p.role.faction, desc:p.role.desc}));
   scheduleBots('role');
+  armAck(20000);   // 누군가 역할 확인을 안 눌러 멈추면 자동 진행
+}
+function armAck(ms){
+  if(!O) return;
+  if(O._ackTimer){ clearTimeout(O._ackTimer); O._ackTimer=null; }
+  const ph=O.phase;
+  O._ackTimer=setTimeout(()=>{ if(O && O.phase===ph && O.pending && O.pending.size>0) oForce(); }, ms);
 }
 function oNight(){
   O.phase='night'; O.nightActions=[];
@@ -928,7 +940,7 @@ function oNight(){
     }
   });
   if(!O.pending.size) oMorning();
-  else scheduleBots('night');
+  else { scheduleBots('night'); armAck(120000); }
 }
 function oMorning(){
   O.phase='morning';
@@ -973,7 +985,7 @@ function oVote(){
     oEmit(p.id,{kind:'vote', targets:oAliveExcept(p.id).map(t=>({id:t.id, name:t.name, revealed:t.revealed, roleName:t.role.name}))});
   });
   if(!O.pending.size) oPunish();
-  else scheduleBots('vote');
+  else { scheduleBots('vote'); armAck(120000); }
 }
 function oPunish(){
   O.phase='punish';
@@ -1020,13 +1032,14 @@ function oGameover(w){
   if(O._mTimer){ clearTimeout(O._mTimer); O._mTimer=null; }
   if(O._pTimer){ clearTimeout(O._pTimer); O._pTimer=null; }
   if(O._secTimer){ clearTimeout(O._secTimer); O._secTimer=null; }
+  if(O._ackTimer){ clearTimeout(O._ackTimer); O._ackTimer=null; }
   oBroadcast({kind:'over', label:w.label, color:w.color,
     reveal:O.players.map(p=>({name:p.name, roleName:p.role.name, color:p.role.color,
       state: p.alive?'생존':(p.deathCause==='vote'?'처형':p.deathCause==='left'?'이탈':'사망')})),
     log:O.log.map(l=>({t:l.t, s:l.s}))});
 }
 function oReturnLobby(){
-  if(O){ ['_discTimer','_mTimer','_pTimer','_secTimer'].forEach(k=>{ if(O[k]){ clearTimeout(O[k]); O[k]=null; } }); }
+  if(O){ ['_discTimer','_mTimer','_pTimer','_secTimer','_ackTimer'].forEach(k=>{ if(O[k]){ clearTimeout(O[k]); O[k]=null; } }); }
   O=null;
   rebroadcastLobby();
 }
@@ -1556,6 +1569,54 @@ function oStatus(i, flash){
 }
 function oStatusAll(){ if(!O) return; O.players.forEach(p=>oStatus(p.id)); }
 
+/* ════════ 제스처 전파(호스트 라우팅) + 3D 좌석 위 표시 ════════ */
+function netGesture(kind){
+  const seat=scene3dMyIndex;
+  if(seat==null || seat<0) return;
+  if(!NET) return;                 // 오프라인이면 1인칭 손만(이미 처리됨)
+  const msg={seat, kind};
+  if(NET.isHost) hostGesture(NET.selfId, msg);
+  else { try{ NET.send.gesture(msg, NET.hostId); }catch(e){} }
+}
+window.netGesture=netGesture;
+function hostGesture(senderPeerId, msg){
+  if(!msg || !NET) return;
+  const peers=(typeof ROSTER!=='undefined' && ROSTER.length)?ROSTER:[];
+  peers.forEach(r=>{
+    if(r.bot) return;
+    if(r.peerId===senderPeerId) return;                       // 보낸 사람은 자기 손으로 이미 봄
+    if(r.peerId===NET.selfId) showSeatGesture(msg.seat, msg.kind);   // 호스트 본인 화면
+    else { try{ NET.send.gesture(msg, r.peerId); }catch(e){} }
+  });
+}
+const GEST_EMOJI={middle:'🖕', thumbsup:'👍', wag:'☝️'};
+function showSeatGesture(seat, kind){
+  try{
+    if(!G3 || !scene3dOn || !G3.T) return;
+    if(seat==null || seat===scene3dMyIndex) return;           // 내 좌석은 1인칭 손으로 봄
+    const T=G3.T, n=getSeatCount();
+    if(seat<0 || seat>=n) return;
+    const a=seatAngle(seat,n), r=2.95;
+    const emoji=GEST_EMOJI[kind]||'✋';
+    const cv=document.createElement('canvas'); cv.width=cv.height=128;
+    const cx=cv.getContext('2d'); cx.font='98px serif'; cx.textAlign='center'; cx.textBaseline='middle';
+    cx.fillText(emoji,64,72);
+    const tex=new T.CanvasTexture(cv); try{ tex.anisotropy=2; }catch(_){}
+    const spr=new T.Sprite(new T.SpriteMaterial({map:tex, transparent:true, depthTest:false}));
+    spr.scale.set(0.85,0.85,0.85);
+    spr.position.set(Math.cos(a)*r, 2.0, Math.sin(a)*r);
+    G3.scene.add(spr);
+    const t0=performance.now();
+    (function anim(){
+      const e=(performance.now()-t0)/1900;
+      if(e>=1 || !G3 || !scene3dOn){ try{ G3&&G3.scene.remove(spr); spr.material.dispose(); tex.dispose(); }catch(_){} return; }
+      spr.position.y=2.0+e*0.85;
+      spr.material.opacity=1-e*e;
+      requestAnimationFrame(anim);
+    })();
+  }catch(e){}
+}
+
 function livesShow(){
   if(document.getElementById('lives')) return;
   const el=document.createElement('div'); el.id='lives';
@@ -2054,7 +2115,7 @@ window.fullscreen=function(){
   [['🖕','중지 올리기','middle'],['👍','따봉','thumbsup'],['☝️','검지 흔들기','wag']].forEach(g=>{
     const b=document.createElement('button'); b.type='button'; b.title=g[1]; b.textContent=g[0];
     b.addEventListener('pointerdown', e=>{ e.stopPropagation(); });
-    b.addEventListener('click', e=>{ e.stopPropagation(); playGesture(g[2]); });
+    b.addEventListener('click', e=>{ e.stopPropagation(); playGesture(g[2]); try{ window.netGesture && window.netGesture(g[2]); }catch(_){} });
     gestWrap.appendChild(b);
   });
   document.body.appendChild(gestWrap);
@@ -2098,50 +2159,4 @@ window.fullscreen=function(){
     const T=G3.T;
     if(!G3.handObj){
       G3.handObj=buildHand(T);
-      G3.handObj.position.set(-0.17,-0.46,-0.62);
-      G3.handObj.rotation.x=-0.18;
-      G3.handObj.visible=false;
-      try{ G3.camera.add(G3.handObj); }catch(_){}
-    }
-    const H=G3.handObj, ud=H.userData;
-    if(gestureKind && performance.now()>gestureEnd){ gestureKind=null; raiseT=0; tgt=[1,1,1,1,1]; }
-    for(let i=0;i<5;i++) curl[i]=lerp(curl[i],tgt[i],0.22);
-    raise=lerp(raise,raiseT,0.16);
-    H.visible = raise>0.02;
-    H.position.y = -0.46 + raise*0.16;
-    // 손목 회전: 따봉이면 시계방향 90°로 꺾어 완성, 검지흔들기면 양옆으로 흔듦
-    const baseZ = (gestureKind==='thumbsup') ? -Math.PI/2 : 0;
-    handBaseZ = lerp(handBaseZ, baseZ, 0.16);
-    let wagZ=0;
-    if(gestureKind==='wag'){ wagPhase+=dt*9; wagZ=Math.sin(wagPhase)*0.5*raise; }   // 양옆으로 흔들기
-    ud.wrist.rotation.z = handBaseZ + wagZ;
-    ud.fingers.forEach((fg,i)=>{ fg.rotation.x = -curl[i+1]*2.55; });               // 0=폄(위) · 1=접음(주먹)
-    // 엄지: 0=폄(따봉 — 손목 90° 회전 후 위를 향함) · 1=접음(다른 손가락처럼 주먹에 붙음)
-    const tc=curl[0];
-    ud.thumb.rotation.z = 1.5708 - tc*2.07;
-    ud.thumb.rotation.x = -tc*2.2;
-  }
-
-  /* ---- 매 프레임 (scene3dLoop에서 호출) → 누르고 있는 동안 계속 ---- */
-  window.joyUpdate=function(){
-    const now=performance.now();
-    let dt=joyLast?(now-joyLast)/1000:0.016; joyLast=now;
-    if(dt>0.05) dt=0.05;
-    if(joyR.x||joyR.y){            // 오른쪽 → 시점 (계속 회전)
-      scene3dYawT   += joyR.x * VIEW_SPEED * dt;
-      scene3dPitchT -= joyR.y * VIEW_SPEED * dt;
-      scene3dYawT   = Math.max(-Math.PI, Math.min(Math.PI, scene3dYawT));
-      scene3dPitchT = Math.max(-0.7, Math.min(0.6, scene3dPitchT));
-    }
-    try{ updateHand(dt); }catch(_){}
-  };
-})();
-
-/* ---------- 시작 ---------- */
-window.addEventListener('error',e=>{try{showErr((e.error&&e.error.message)||e.message||'오류');}catch(_){}});
-window.addEventListener('unhandledrejection',e=>{try{showErr((e.reason&&e.reason.message)||'연결 오류');}catch(_){}});
-initCueUI();
-screenHome();
-</script>
-</body>
-</html>
+      G3.handO
