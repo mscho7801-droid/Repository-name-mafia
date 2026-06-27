@@ -140,6 +140,10 @@ const gate = document.getElementById('gate');
 const gateWho = document.getElementById('gateWho');
 const gateHint = document.getElementById('gateHint');
 
+/* 초기화 단계의 오류도 화면에 보이도록 최상단에서 등록 */
+window.addEventListener('error', e=>{ try{ showErr((e.error&&e.error.message)||e.message||'오류'); }catch(_){} });
+window.addEventListener('unhandledrejection', e=>{ try{ console.warn('unhandledrejection:', (e.reason&&e.reason.message)||e.reason); }catch(_){} });
+
 const ROLES = {
   mafia:    {id:'mafia',    name:'마피아', faction:'mafia',   ability:'kill',        night:true,  color:'var(--crimson)', desc:'밤마다 한 명을 지목해 살해한다.'},
   citizen:  {id:'citizen',  name:'시민',   faction:'citizen', ability:'none',        night:false, color:'var(--bone)',    desc:'특별한 능력은 없다. 추리로 마피아를 찾아라.'},
@@ -1955,7 +1959,7 @@ function scene3dHide(){
 
 function scene3dNight(on){ scene3dWantNight=!!on; }
 
-(function initDrag(){
+try{(function initDrag(){
   let dragging=false, lx=0, ly=0, dx0=0, dy0=0, moved=false, tdown=0, dtarget=null;
   const noRotate=(el)=>{
     while(el && el!==document.body){
@@ -1979,7 +1983,7 @@ function scene3dNight(on){ scene3dWantNight=!!on; }
   window.addEventListener('pointermove', e=>move(e.clientX,e.clientY), {passive:true});
   window.addEventListener('pointerup', e=>up(e.clientX,e.clientY), {passive:true});
   window.addEventListener('pointercancel', ()=>{ dragging=false; }, {passive:true});
-})();
+})();}catch(__e1){console.warn('initDrag init failed:',__e1);}
 
 if(typeof cue==='function'){
   const _cue=cue;
@@ -2028,7 +2032,7 @@ window.fullscreen=function(){
   }catch(e){}
 };
 
-(function initControls(){
+try{(function initControls(){
   const VIEW_SPEED = 2.4;   // 시점 회전 속도 (누르고 있는 동안 계속 회전)
   const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
   const lerp=(a,b,t)=>a+(b-a)*t;
@@ -2147,16 +2151,4 @@ window.fullscreen=function(){
       wrist.add(fg); fingers.push(fg);
     });
     // 엄지
-    const thumb=new T.Group(); thumb.position.set(-0.10,0.05,0.02);
-    const tseg=cap(0.034,0.14); tseg.position.y=0.07; thumb.add(tseg);
-    wrist.add(thumb);
-    H.userData={fingers, thumb, wrist};
-    return H;
-  }
-
-  function updateHand(dt){
-    if(typeof G3==='undefined' || !G3 || !G3.T) return;
-    const T=G3.T;
-    if(!G3.handObj){
-      G3.handObj=buildHand(T);
-      G3.handO
+    const thumb=new T.G
